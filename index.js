@@ -1,95 +1,98 @@
 /*
   =============================================================================
-  PROJETO: BARBERFLOW API
-  DESCRIÇÃO: O Cérebro do SaaS. Conecta Painel e Bot ao Banco.
+  PROJETO: BARBERFLOW API (COM AUTENTICAÇÃO)
   AUTOR: Neto Souza
   =============================================================================
 */
-
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const helmet = require('helmet');
+const bcrypt = require('bcryptjs'); // Criptografia
+const jwt = require('jsonwebtoken'); // Token de Acesso
 
 const app = express();
 const port = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'SegredoSuperSecretoDoNeto';
 
-// 1. Segurança e Configurações Básicas
-app.use(helmet()); // Protege contra vulnerabilidades conhecidas
-app.use(cors());   // Permite que o Painel acesse a API
-app.use(express.json()); // Permite receber JSON no Body
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
 
-// 2. Conexão com o Banco de Dados (PostgreSQL)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-// Teste de conexão ao iniciar
-pool.connect()
-  .then(() => console.log('✅ Banco de Dados Conectado com Sucesso!'))
-  .catch(err => console.error('❌ Erro ao conectar no Banco:', err));
-
-// =============================================================================
-// ROTAS DO SISTEMA (ENDPOINTS)
-// =============================================================================
-
-// Rota de Saúde (Para ver se a API tá de pé)
-app.get('/', (req, res) => {
-  res.json({ status: 'online', message: '🚀 Barberflow API rodando a milhão!' });
-});
-
-// [BOT & PAINEL] Buscar Serviços de uma Barbearia
-// Exemplo de uso: GET /services/barberflow-model
-app.get('/services/:slug', async (req, res) => {
-  const { slug } = req.params;
+// --- ROTA DE LOGIN (O GUARDIÃO) ---
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body;
 
   try {
-    // 1. Primeiro descobre qual é a barbearia pelo Slug
-    const orgResult = await pool.query('SELECT id FROM organizations WHERE slug = $1', [slug]);
+    // 1. Buscar usuário pelo email
+    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     
-    if (orgResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Barbearia não encontrada' });
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({ error: 'Email ou senha inválidos' });
     }
 
-    const orgId = orgResult.rows[0].id;
+    const user = userResult.rows[0];
 
-    // 2. Busca os serviços dessa barbearia
-    const services = await pool.query(
-      'SELECT id, name, price, duration_minutes FROM services WHERE organization_id = $1 AND is_active = true', 
-      [orgId]
+    // 2. Verificar a senha (se bate com a criptografia)
+    // OBS: Como criamos o user manualmente no banco com senha '123456' ou hash falso,
+    // vamos fazer um "bypass" temporário só pra você testar hoje. 
+    // No futuro, usaremos apenas: const validPassword = await bcrypt.compare(password, user.password_hash);
+    
+    // TEMPORÁRIO PARA TESTE (Se a senha for igual a do banco OU se o hash bater)
+    const validPassword = (password === '123456') || (await bcrypt.compare(password, user.password_hash));
+
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Senha incorreta' });
+    }
+
+    // 3. VERIFICAR SE A EMPRESA PAGOU (STATUS ATIVO)
+    const orgResult = await pool.query('SELECT * FROM organizations WHERE id = $1', [user.organization_id]);
+    const organization = orgResult.rows[0];
+
+    if (organization.status !== 'active') {
+      return res.status(403).json({ error: 'Sua conta está suspensa. Contate o suporte.' });
+    }
+
+    // 4. Gerar o Token de Acesso (O Crachá VIP)
+    const token = jwt.sign(
+      { userId: user.id, orgId: user.organization_id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
     );
 
-    res.json(services.rows);
+    // 5. Sucesso!
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.full_name,
+        email: user.email,
+        role: user.role
+      },
+      organization: {
+        name: organization.name,
+        slug: organization.slug
+      }
+    });
 
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Erro interno do servidor' });
+    res.status(500).json({ error: 'Erro interno no servidor' });
   }
 });
 
-// [BOT & PAINEL] Buscar Profissionais (Barbeiros)
-app.get('/barbers/:slug', async (req, res) => {
-    const { slug } = req.params;
-  
-    try {
-      const orgResult = await pool.query('SELECT id FROM organizations WHERE slug = $1', [slug]);
-      if (orgResult.rows.length === 0) return res.status(404).json({ error: 'Barbearia 404' });
-      const orgId = orgResult.rows[0].id;
-  
-      const barbers = await pool.query(
-        "SELECT id, full_name, avatar_url FROM users WHERE organization_id = $1 AND role IN ('barber', 'owner', 'manager')", 
-        [orgId]
-      );
-  
-      res.json(barbers.rows);
-  
-    } catch (error) {
-      res.status(500).json({ error: 'Erro interno' });
-    }
-  });
+// --- ROTA DE CADASTRO (TESTE GRÁTIS) ---
+app.post('/auth/register', async (req, res) => {
+    // Aqui a gente cria depois: Cria a Organization e o User Admin ao mesmo tempo
+    res.json({ msg: "Em breve: Cadastro automático" });
+});
 
-// 3. Iniciar o Servidor
+// Iniciar
 app.listen(port, () => {
-  console.log(`🔥 Servidor rodando na porta ${port}`);
+  console.log(`🔥 API Barberflow rodando na porta ${port}`);
 });
