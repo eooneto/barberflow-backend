@@ -179,3 +179,72 @@ app.delete('/customers/:id', authenticateToken, async (req, res) => {
 app.listen(port, () => {
   console.log(`🔥 API rodando na porta ${port}`);
 });
+
+
+// =============================================================================
+// ROTAS PRIVADAS - AGENDA (APPOINTMENTS) 📅
+// =============================================================================
+
+// Listar Agendamentos do Dia
+app.get('/appointments', authenticateToken, async (req, res) => {
+    const { date } = req.query; // Formato esperado: YYYY-MM-DD
+    
+    if (!date) return res.status(400).json({ error: 'Data obrigatória' });
+
+    try {
+        // Busca agendamentos do dia + Nome do Cliente + Nome do Serviço
+        const query = `
+            SELECT a.*, c.name as customer_name, c.phone as customer_phone, s.name as service_name, s.duration, s.price
+            FROM appointments a
+            LEFT JOIN customers c ON a.customer_id = c.id
+            LEFT JOIN services s ON a.service_id = s.id
+            WHERE a.organization_id = $1 
+            AND a.date_time::date = $2::date
+            ORDER BY a.date_time ASC
+        `;
+        const { rows } = await pool.query(query, [req.user.organization_id, date]);
+        res.json(rows);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Erro ao buscar agenda' });
+    }
+});
+
+// Criar Agendamento
+app.post('/appointments', authenticateToken, async (req, res) => {
+    const { customer_id, service_id, date_time, notes } = req.body;
+    try {
+        const { rows } = await pool.query(
+            'INSERT INTO appointments (organization_id, customer_id, service_id, date_time, notes, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            [req.user.organization_id, customer_id, service_id, date_time, notes, 'confirmed']
+        );
+        res.status(201).json(rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Erro ao agendar' });
+    }
+});
+
+// Atualizar Status (Concluir/Cancelar)
+app.patch('/appointments/:id/status', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body; // 'completed' ou 'cancelled'
+    try {
+        const { rows } = await pool.query(
+            'UPDATE appointments SET status = $1 WHERE id = $2 AND organization_id = $3 RETURNING *',
+            [status, id, req.user.organization_id]
+        );
+        
+        // Se concluiu, adiciona +1 na fidelidade do cliente
+        if(status === 'completed') {
+             const appointment = rows[0];
+             if(appointment.customer_id) {
+                 await pool.query('UPDATE customers SET total_visits = total_visits + 1 WHERE id = $1', [appointment.customer_id]);
+             }
+        }
+
+        res.json(rows[0]);
+    } catch (error) {
+        res.status(500).json({ error: 'Erro ao atualizar status' });
+    }
+});
