@@ -248,3 +248,127 @@ app.patch('/appointments/:id/status', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Erro ao atualizar status' });
     }
 });
+
+
+// =============================================================================
+// ROTAS - EQUIPE / PROFISSIONAIS ✂️
+// =============================================================================
+
+// 1. Listar Profissionais (Para o Card do Painel)
+app.get('/professionals', authenticateToken, async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM professionals WHERE organization_id = $1 AND active = true ORDER BY name',
+            [req.user.organization_id]
+        );
+        res.json(rows);
+    } catch (error) {
+        res.status(500).json({ error: 'Erro ao buscar equipe' });
+    }
+});
+
+// 2. Criar ou Editar Profissional (Tab Perfil)
+app.post('/professionals', authenticateToken, async (req, res) => {
+    const { id, name, phone, email } = req.body;
+    try {
+        if (id) {
+            // Atualizar
+            await pool.query(
+                'UPDATE professionals SET name = $1, phone = $2 WHERE id = $3 AND organization_id = $4',
+                [name, phone, id, req.user.organization_id]
+            );
+            res.json({ id, name, phone });
+        } else {
+            // Criar Novo
+            const { rows } = await pool.query(
+                'INSERT INTO professionals (organization_id, name, phone) VALUES ($1, $2, $3) RETURNING id',
+                [req.user.organization_id, name, phone]
+            );
+            res.json({ id: rows[0].id, name, phone });
+        }
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Erro ao salvar profissional' });
+    }
+});
+
+// 3. Buscar e Salvar Horários (Tab Jornada)
+app.get('/professionals/:id/schedule', authenticateToken, async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT * FROM working_hours WHERE professional_id = $1 ORDER BY day_of_week',
+            [req.params.id]
+        );
+        res.json(rows);
+    } catch (error) { res.status(500).json({ error: 'Erro ao buscar horários' }); }
+});
+
+app.post('/professionals/:id/schedule', authenticateToken, async (req, res) => {
+    const { schedule } = req.body; // Array de horários
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        // Limpa anteriores
+        await client.query('DELETE FROM working_hours WHERE professional_id = $1', [req.params.id]);
+        
+        // Insere novos
+        for (const day of schedule) {
+            if (day.active) {
+                await client.query(
+                    'INSERT INTO working_hours (professional_id, day_of_week, start_time, end_time) VALUES ($1, $2, $3, $4)',
+                    [req.params.id, day.day_of_week, day.start_time, day.end_time]
+                );
+            }
+        }
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: 'Erro ao salvar horários' });
+    } finally {
+        client.release();
+    }
+});
+
+// 4. Buscar e Salvar Serviços do Profissional (Tab Serviços)
+app.get('/professionals/:id/services', authenticateToken, async (req, res) => {
+    try {
+        // Traz TODOS os serviços da barbearia e marca quais esse profissional faz
+        const query = `
+            SELECT s.id, s.name, s.duration as default_duration, 
+                   ps.custom_duration, ps.enabled
+            FROM services s
+            LEFT JOIN professional_services ps ON s.id = ps.service_id AND ps.professional_id = $1
+            WHERE s.organization_id = $2 AND s.active = true
+            ORDER BY s.name
+        `;
+        const { rows } = await pool.query(query, [req.params.id, req.user.organization_id]);
+        res.json(rows);
+    } catch (error) { res.status(500).json({ error: 'Erro ao buscar serviços' }); }
+});
+
+app.post('/professionals/:id/services', authenticateToken, async (req, res) => {
+    const { services } = req.body;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM professional_services WHERE professional_id = $1', [req.params.id]);
+        
+        for (const s of services) {
+            if (s.enabled) {
+                await client.query(
+                    'INSERT INTO professional_services (professional_id, service_id, custom_duration, enabled) VALUES ($1, $2, $3, true)',
+                    [req.params.id, s.id, s.custom_duration || null]
+                );
+            }
+        }
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(error);
+        res.status(500).json({ error: 'Erro ao vincular serviços' });
+    } finally {
+        client.release();
+    }
+});
