@@ -11,6 +11,88 @@ const cors = require('cors');
 const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const http = require('http');
+const https = require('https');
+
+// Evolution API (WhatsApp)
+const EVOLUTION_BASE_URL = String(process.env.EVOLUTION_BASE_URL || '').replace(/\/+$/, '');
+const EVOLUTION_API_KEY = String(process.env.EVOLUTION_API_KEY || '');
+
+// =============================================================================
+// EVOLUTION HELPERS
+// =============================================================================
+function sanitizePhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return digits || null;
+}
+
+function isAlreadyExistsError(err) {
+  const msg = String(err?.data?.message || err?.data?.error || err?.message || '').toLowerCase();
+  return err?.status === 409 || msg.includes('already') || msg.includes('exists') || msg.includes('duplic');
+}
+
+function requireEvolutionConfig(res) {
+  if (!EVOLUTION_BASE_URL || !EVOLUTION_API_KEY) {
+    res.status(500).json({
+      error: 'Evolution não configurada. Defina EVOLUTION_BASE_URL e EVOLUTION_API_KEY no backend.',
+    });
+    return false;
+  }
+  return true;
+}
+
+function evoRequest(path, { method = 'GET', query, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(EVOLUTION_BASE_URL + (path.startsWith('/') ? path : `/${path}`));
+    if (query && typeof query === 'object') {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+      }
+    }
+
+    const isHttps = url.protocol === 'https:';
+    const lib = isHttps ? https : http;
+
+    const req = lib.request(
+      url,
+      {
+        method,
+        headers: {
+          apikey: EVOLUTION_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      },
+      (resp) => {
+        let raw = '';
+        resp.setEncoding('utf8');
+        resp.on('data', (chunk) => (raw += chunk));
+        resp.on('end', () => {
+          const status = resp.statusCode || 0;
+          let data = raw;
+          try {
+            data = raw ? JSON.parse(raw) : null;
+          } catch (_) {}
+
+          if (status >= 200 && status < 300) return resolve(data);
+
+          const e = new Error('Evolution API error');
+          e.status = status;
+          e.data = data;
+          return reject(e);
+        });
+      }
+    );
+
+    req.on('error', (err) => reject(err));
+    req.on('timeout', () => {
+      req.destroy(new Error('Evolution API timeout'));
+    });
+
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -89,6 +171,135 @@ app.post('/auth/login', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// =============================================================================
+// ROTAS PRIVADAS - INTEGRAÇÕES (WhatsApp / Evolution)
+// =============================================================================
+
+// Conectar WhatsApp (gera pairingCode)
+app.post('/integrations/whatsapp/connect', authenticateToken, async (req, res) => {
+  if (!requireEvolutionConfig(res)) return;
+
+  const { number } = req.body || {};
+  const phone = sanitizePhone(number);
+
+  try {
+    const orgRes = await pool.query(
+      'SELECT id, slug, whatsapp_instance_id FROM organizations WHERE id = $1',
+      [req.user.organization_id]
+    );
+    if (orgRes.rows.length === 0) return res.status(404).json({ error: 'Organização não encontrada' });
+
+    const org = orgRes.rows[0];
+    const instanceName = org.whatsapp_instance_id || org.slug;
+
+    if (!instanceName) {
+      return res.status(400).json({ error: 'Organização sem slug/whatsapp_instance_id' });
+    }
+
+    // Persistir instanceName (se ainda não estiver salvo)
+    if (!org.whatsapp_instance_id) {
+      await pool.query(
+        'UPDATE organizations SET whatsapp_instance_id = $1, updated_at = NOW() WHERE id = $2',
+        [instanceName, org.id]
+      );
+    }
+
+    // 1) Criar instância (se já existir, seguimos)
+    try {
+      await evoRequest('/instance/create', {
+        method: 'POST',
+        body: {
+          instanceName,
+          number: phone || undefined,
+          qrcode: true,
+          integration: 'WHATSAPP-BAILEYS',
+          groupsIgnore: true,
+          rejectCall: true,
+          msgCall: 'Desculpe, não atendemos ligações. Envie uma mensagem 😊',
+          readMessages: false,
+          readStatus: false,
+          alwaysOnline: false,
+          syncFullHistory: false,
+        },
+      });
+    } catch (err) {
+      if (!isAlreadyExistsError(err)) throw err;
+    }
+
+    // 2) Gerar pairingCode (WhatsApp -> Aparelhos conectados -> Vincular com código)
+    const connectData = await evoRequest(`/instance/connect/${encodeURIComponent(instanceName)}`, {
+      method: 'GET',
+      query: phone ? { number: phone } : undefined,
+    });
+
+    return res.json({ instanceName, ...connectData });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: 'Erro ao conectar WhatsApp',
+      details: error?.data || error?.message || String(error),
+    });
+  }
+});
+
+// Status da conexão (open/close)
+app.get('/integrations/whatsapp/status', authenticateToken, async (req, res) => {
+  if (!requireEvolutionConfig(res)) return;
+
+  try {
+    const orgRes = await pool.query(
+      'SELECT id, slug, whatsapp_instance_id FROM organizations WHERE id = $1',
+      [req.user.organization_id]
+    );
+    if (orgRes.rows.length === 0) return res.status(404).json({ error: 'Organização não encontrada' });
+
+    const org = orgRes.rows[0];
+    const instanceName = org.whatsapp_instance_id || org.slug;
+    if (!instanceName) return res.status(400).json({ error: 'Organização sem slug/whatsapp_instance_id' });
+
+    const status = await evoRequest(`/instance/connectionState/${encodeURIComponent(instanceName)}`, {
+      method: 'GET',
+    });
+
+    return res.json({ instanceName, ...status });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: 'Erro ao buscar status do WhatsApp',
+      details: error?.data || error?.message || String(error),
+    });
+  }
+});
+
+// Logout / Desconectar
+app.delete('/integrations/whatsapp/logout', authenticateToken, async (req, res) => {
+  if (!requireEvolutionConfig(res)) return;
+
+  try {
+    const orgRes = await pool.query(
+      'SELECT id, slug, whatsapp_instance_id FROM organizations WHERE id = $1',
+      [req.user.organization_id]
+    );
+    if (orgRes.rows.length === 0) return res.status(404).json({ error: 'Organização não encontrada' });
+
+    const org = orgRes.rows[0];
+    const instanceName = org.whatsapp_instance_id || org.slug;
+    if (!instanceName) return res.status(400).json({ error: 'Organização sem slug/whatsapp_instance_id' });
+
+    const out = await evoRequest(`/instance/logout/${encodeURIComponent(instanceName)}`, {
+      method: 'DELETE',
+    });
+
+    return res.json({ instanceName, ...out });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      error: 'Erro ao desconectar WhatsApp',
+      details: error?.data || error?.message || String(error),
+    });
   }
 });
 
